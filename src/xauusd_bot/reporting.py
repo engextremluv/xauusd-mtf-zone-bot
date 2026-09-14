@@ -31,13 +31,15 @@ def compute_stats(result: BacktestResult, starting_equity: float) -> Performance
     if len(log) == 0:
         total_trades = win_rate = profit_factor = total_pnl = 0.0
     else:
-        # count round-turn closes (exclude partials to avoid double-counting
-        # one trade as multiple "wins"); partials still count toward PnL.
-        finals = log[~log["partial"]]
-        total_trades = len(finals)
-        wins = finals[finals["pnl"] > 0]
-        losses = finals[finals["pnl"] < 0]
-        win_rate = len(wins) / total_trades if total_trades else 0.0
+        # Win rate must be judged per ORIGINAL POSITION, not per closed
+        # leg: a position that banked a big profit at the 30M roadblock
+        # (spec 23) and then had its small runner stopped near breakeven
+        # is a WINNING trade overall, even though its last leg's reason
+        # is "sl". Summing every leg's pnl by position_id and checking
+        # the total avoids undercounting these as losses.
+        by_position = log.groupby("position_id")["pnl"].sum()
+        total_trades = len(by_position)
+        win_rate = (by_position > 0).sum() / total_trades if total_trades else 0.0
         gross_profit = log.loc[log["pnl"] > 0, "pnl"].sum()
         gross_loss = -log.loc[log["pnl"] < 0, "pnl"].sum()
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")

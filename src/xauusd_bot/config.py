@@ -97,6 +97,18 @@ class StrategyConfig:
     initial_sl_buffer_pips_min: float = 0.5
     initial_sl_buffer_pips_max: float = 1.0
 
+    # --- Entry fill behaviour (spec sections 15/16) ---
+    # The spec's literal text: prefer a fill at the "structural entry
+    # level" (the setup/"X" candle's far wick), and only chase the
+    # market if price "never returns" to it. True means: after a 5M
+    # confirmation, place a limit-style order at that level and wait up
+    # to `pullback_max_wait_bars` further 5-minute bars for price to
+    # touch it; if it never does, the trade is skipped entirely (no
+    # chase). False (the original simplification) enters at market
+    # immediately after the confirmation candle closes, every time.
+    require_pullback_entry: bool = True
+    pullback_max_wait_bars: int = 12  # 12 x 5min = 1 hour
+
     # --- Progressive SL / break-even (spec section 21) ---
     sl_steps: list[SLStep] = field(
         default_factory=lambda: [
