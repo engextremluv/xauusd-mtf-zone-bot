@@ -1,4 +1,19 @@
-# XAUUSD Multi-Timeframe Candle-Zone Backtester
+# XAUUSD Strategy Backtesters
+
+Two independent, unrelated backtesting engines for trading XAUUSD, kept
+in one repo because they share the same low-level building blocks
+(`InstrumentSpec`, risk/position sizing, timeframe resampling):
+
+1. **The multi-timeframe candle-zone strategy** (`xauusd_bot/`, excluding
+   `h4_pullback/`) -- documented below.
+2. **The H4 Three-Candle Pullback strategy** (`xauusd_bot/h4_pullback/`)
+   -- documented in its own section further down.
+
+They are not variants of each other and don't share strategy logic --
+only the instrument spec, risk-sizing helpers, and timeframe-building
+code are common.
+
+## 1. Multi-Timeframe Candle-Zone Strategy
 
 A Python backtesting engine for the multi-timeframe candle-zone strategy
 described in the project's `Master Trading Strategy Specification` (Daily
@@ -7,6 +22,14 @@ progressive stop-loss, a 30M "roadblock" partial close, and a 4H final
 target). This is a **backtester**, not a live MT5 Expert Advisor -- it
 exists to test whether the rules in the spec have a positive expectancy
 before anyone considers building the real EA or trading real money.
+
+**Result so far: every configuration tested (multiple stop-loss widths,
+chase-vs-pullback entries, 5M vs 15M entry timeframe, across 2020/2022
+XAUUSD) has lost money and wiped out the test account.** See the git
+history / commit messages for the debugging trail. The most promising
+unresolved lead is a multi-day lag in the Daily trend-structure filter
+(see `market_structure.py`'s swing-detection assumption) -- not yet
+fixed or re-tested.
 
 > **This is not financial advice and this strategy has not been shown to
 > be profitable.** A backtest, even a correct one, is not proof a
@@ -169,3 +192,109 @@ invalidation, retest, direction reversal, multiple concurrent historical
 zones), and risk sizing (exact dollar risk from the real contract spec,
 aggregate cap enforcement, daily drawdown halt/reset). `test_engine.py`
 is an end-to-end plumbing smoke test on synthetic data.
+
+---
+
+## 2. H4 Three-Candle Pullback Strategy
+
+A second, much simpler, fully independent strategy, from an uploaded
+strategy book (not part of the candle-zone spec above). Lives entirely
+under `xauusd_bot/h4_pullback/`.
+
+**Rules:**
+1. **Direction** -- Daily chart, 50 EMA on close. If yesterday's
+   completed daily candle closed above the EMA, today is BUY-only;
+   below, SELL-only.
+2. **Setup** -- on the H4 chart, 3 consecutive closed candles against
+   the direction (3 red in BUY mode, 3 green in SELL mode). A doji
+   (open == close) breaks the run.
+3. **Entry** -- market order at the open of the next H4 candle.
+4. **Stop** = 2 × ATR(14) on H4 (the ATR value as of the candle that
+   just completed the 3-candle pattern). **Take profit** = same
+   distance, opposite side (1:1 reward:risk).
+5. **Time limit** -- close at market if neither level is hit within 200
+   hours (~8 days).
+6. **One trade at a time** -- no new entries while a position is open.
+
+### Result so far: this one looks real
+
+Independently re-implemented and tested against real 2020-2026 XAUUSD
+5-minute bid+ask data (not the book's own claimed results) -- see
+`tests/h4_pullback/` for the unit tests and the git history for the
+full verification writeup. On the 2022-Sept 2026 window the book itself
+claims to have tested, with **real bid/ask spread cost included on
+every entry and exit**:
+
+| | Book's claim | Independent re-test |
+|---|---|---|
+| Trades | 368 | 335 |
+| Win rate | 55.7% | 57.0% |
+| Total result | +43.1R | +47.3R |
+| Buys | 249 trades, 58.2% win, +42.0R | 223 trades, 60.1% win, +45.1R |
+| Sells | 119 trades, 50.4% win, +1.1R | 112 trades, 50.9% win, +2.2R |
+
+That's a close, independently-reproduced match, not a case of an
+inflated marketing claim falling apart under scrutiny. Caveats, confirmed
+by testing outside the book's own window:
+- Tested on 2020-2021 too (outside the book's claimed window): the
+  strategy was roughly flat-to-slightly-negative there. This appears to
+  be a trend-following system that works well in a sustained uptrend
+  (which 2022-2026 gold was), not a universally robust edge.
+- Almost all the profit comes from BUYS; sells are barely above
+  breakeven. In practice this behaves like a long-biased system.
+- The edge per trade is small (~0.08-0.12R average) and sensitive to
+  real-world costs beyond what's modeled here (wider broker spreads,
+  slippage, overnight swap fees on ~31-hour average hold times).
+
+None of this is a reason to trust it blindly -- paper-trade first, per
+the source book's own recommendation.
+
+### Implementation notes / assumptions
+
+- **ATR(14)** is a plain simple moving average of True Range (MT5's
+  native ATR indicator convention), not the Wilder-smoothed ATR used
+  by some other platforms/libraries -- these diverge by a few percent.
+- **Fills use real bid/ask spread**: a BUY enters at the ASK and exits
+  (SL/TP/time-limit) at the BID; a SELL enters at the BID and exits at
+  the ASK. Structure (EMA, ATR, the 3-candle pattern) is read off the
+  bid chart, same as a trader would see.
+- **5-minute fill granularity**, not true minute-level data -- a
+  reasonable approximation, but if the stop and target are both
+  touched within the same 5-minute bar, this counts it as a loss (same
+  conservative convention the source book describes for its own
+  minute-level testing).
+- **Position sizing** reuses `risk.max_lots_for_budget` from the other
+  strategy's risk engine: `risk_percent` of *current* equity (compounds)
+  divided by the real dollar risk at the stop distance, rounded down to
+  the broker's lot step. A signal is silently skipped if the resulting
+  size would round below the minimum lot -- this is why trade counts can
+  differ slightly from a naive "take every signal" tally.
+
+### Running it
+
+```bash
+# fetch real bid+ask 5-minute data (needs network -- see the note in
+# the candle-zone strategy's "Getting historical data" section above
+# about why this couldn't be fetched from inside this project's own dev
+# sandbox)
+xauusd-bot run-h4-pullback --start 2022-01-01 --end 2026-09-01 --equity 10000 --risk-percent 1.0 --out results/
+
+# or from a local CSV (columns: timestamp,open,high,low,close,ao,ah,al,ac)
+xauusd-bot run-h4-pullback --csv path/to/your_bidask_data.csv --equity 10000 --out results/
+```
+
+Prints total trades, win rate, total/average R, max drawdown (in R and
+%), final equity, and a by-year and by-direction breakdown. With `--out`,
+also writes `h4_pullback_trades.csv` and `h4_pullback_equity_curve.csv`.
+
+### Testing
+
+```bash
+pytest tests/h4_pullback/ -v
+```
+
+Covers: EMA/ATR computed against hand-calculated values, the 3-candle
+setup detection and next-bar entry timing, bid/ask fill correctness in
+both directions (this is where a backtest most commonly cheats itself
+by secretly trading at one frictionless price), and that a second
+signal is correctly blocked while a trade is already open.
