@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from xauusd_bot.h4_pullback.indicators import candle_color, compute_atr, compute_ema
+from xauusd_bot.indicators import candle_color, compute_atr, compute_ema
 
 
 def test_candle_color():

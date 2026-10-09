@@ -1,15 +1,14 @@
-"""Build the Daily / 4H / 30M timeframes from a single base 5-minute feed.
+"""Build the Daily / 4H timeframes from a single base 5-minute feed.
 
 Deriving every higher timeframe from one 5M series (rather than fetching
-each timeframe independently from the data provider) guarantees their
-candle boundaries are mutually consistent -- exactly what a real EA gets
-by building higher timeframes off the same underlying tick/M1 feed.
+each timeframe independently) guarantees their candle boundaries are
+mutually consistent -- the same way a real trading platform builds
+higher timeframes off one underlying tick/M1 feed.
 
-Assumption made explicit here (spec does not state a session boundary):
-day and 4H boundaries are anchored to 00:00 UTC. If your broker's server
-time / "trading day" starts elsewhere (many use 17:00 or 22:00 UTC), set
-`daily_origin_offset_hours` accordingly before trusting Daily-timeframe
-structure calls.
+Assumption made explicit here: day and 4H boundaries are anchored to
+00:00 UTC. If your broker's server time / "trading day" starts elsewhere
+(many use 17:00 or 22:00 UTC), set `daily_origin_offset_hours`
+accordingly before trusting Daily-timeframe results against it.
 """
 from __future__ import annotations
 

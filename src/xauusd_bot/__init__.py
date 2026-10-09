@@ -1,1 +1,1 @@
-"""XAUUSD multi-timeframe candle-zone strategy: backtesting engine."""
+"""XAUUSD H4 Three-Candle Pullback strategy: backtesting engine."""

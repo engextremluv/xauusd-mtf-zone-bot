@@ -1,68 +1,88 @@
-"""Summary statistics and CSV export for a BacktestResult."""
+"""Summary statistics for an H4PullbackResult.
+
+The equity curve from H4PullbackEngine is sampled only at trade closes
+(there is at most one open position at a time, so that's every point
+where equity actually changes), not a continuous bar-by-bar series.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .engine import BacktestResult
+from .engine import H4PullbackResult
 
 
 @dataclass
-class PerformanceStats:
+class H4PullbackStats:
     total_trades: int
     win_rate: float
-    profit_factor: float
-    total_pnl: float
-    max_drawdown: float
-    max_drawdown_pct: float
+    total_r: float
+    avg_r_per_trade: float
+    max_drawdown_r: float
     final_equity: float
+    max_drawdown_pct: float
 
     def as_dict(self) -> dict:
         return self.__dict__
 
 
-def compute_stats(result: BacktestResult, starting_equity: float) -> PerformanceStats:
-    log = result.trade_log
-    equity = result.equity_curve["equity"]
+def compute_stats(result: H4PullbackResult, starting_equity: float) -> H4PullbackStats:
+    trades = result.trades
+    if len(trades) == 0:
+        return H4PullbackStats(0, 0.0, 0.0, 0.0, 0.0, starting_equity, 0.0)
 
-    if len(log) == 0:
-        total_trades = win_rate = profit_factor = total_pnl = 0.0
-    else:
-        # Win rate must be judged per ORIGINAL POSITION, not per closed
-        # leg: a position that banked a big profit at the 30M roadblock
-        # (spec 23) and then had its small runner stopped near breakeven
-        # is a WINNING trade overall, even though its last leg's reason
-        # is "sl". Summing every leg's pnl by position_id and checking
-        # the total avoids undercounting these as losses.
-        by_position = log.groupby("position_id")["pnl"].sum()
-        total_trades = len(by_position)
-        win_rate = (by_position > 0).sum() / total_trades if total_trades else 0.0
-        gross_profit = log.loc[log["pnl"] > 0, "pnl"].sum()
-        gross_loss = -log.loc[log["pnl"] < 0, "pnl"].sum()
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
-        total_pnl = log["pnl"].sum()
+    win_rate = (trades["r_multiple"] > 0).mean()
+    total_r = trades["r_multiple"].sum()
+    avg_r = trades["r_multiple"].mean()
 
-    running_max = equity.cummax()
-    drawdown = equity - running_max
-    max_dd = drawdown.min() if len(drawdown) else 0.0
-    max_dd_pct = (drawdown / running_max).min() * 100 if len(drawdown) else 0.0
+    cum_r = trades["r_multiple"].cumsum()
+    running_max_r = cum_r.cummax()
+    drawdown_r = cum_r - running_max_r
+    max_dd_r = drawdown_r.min()
 
-    return PerformanceStats(
-        total_trades=int(total_trades),
+    equity = result.equity_curve["equity"] if len(result.equity_curve) else pd.Series([starting_equity])
+    running_max_eq = equity.cummax()
+    dd_pct = ((equity - running_max_eq) / running_max_eq).min() * 100
+
+    return H4PullbackStats(
+        total_trades=int(len(trades)),
         win_rate=float(win_rate),
-        profit_factor=float(profit_factor),
-        total_pnl=float(total_pnl),
-        max_drawdown=float(max_dd),
-        max_drawdown_pct=float(max_dd_pct),
+        total_r=float(total_r),
+        avg_r_per_trade=float(avg_r),
+        max_drawdown_r=float(max_dd_r),
         final_equity=float(equity.iloc[-1]) if len(equity) else starting_equity,
+        max_drawdown_pct=float(dd_pct),
     )
 
 
-def save_reports(result: BacktestResult, out_dir: str | Path) -> None:
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    result.trade_log.to_csv(out_dir / "trades.csv", index=False)
-    result.equity_curve.to_csv(out_dir / "equity_curve.csv")
+def by_year(result: H4PullbackResult) -> pd.DataFrame:
+    trades = result.trades.copy()
+    if len(trades) == 0:
+        return pd.DataFrame(columns=["count", "total_r", "avg_r", "win_rate"])
+    trades["year"] = pd.to_datetime(trades["opened_at"]).dt.year
+    g = trades.groupby("year")
+    return pd.DataFrame(
+        {
+            "count": g.size(),
+            "total_r": g["r_multiple"].sum(),
+            "avg_r": g["r_multiple"].mean(),
+            "win_rate": g["r_multiple"].apply(lambda s: (s > 0).mean()),
+        }
+    )
+
+
+def by_direction(result: H4PullbackResult) -> pd.DataFrame:
+    trades = result.trades
+    if len(trades) == 0:
+        return pd.DataFrame(columns=["count", "total_r", "avg_r", "win_rate"])
+    g = trades.groupby("direction")
+    return pd.DataFrame(
+        {
+            "count": g.size(),
+            "total_r": g["r_multiple"].sum(),
+            "avg_r": g["r_multiple"].mean(),
+            "win_rate": g["r_multiple"].apply(lambda s: (s > 0).mean()),
+        }
+    )

@@ -1,9 +1,6 @@
-"""EA-style configurable inputs for the strategy.
-
-Mirrors section 35 ("CONFIGURABLE EA INPUTS") of the strategy spec.
-Every numeric rule in the spec is exposed here rather than hard-coded,
-so the backtest can be re-run under different assumptions without
-touching strategy code.
+"""Configuration: the broker/instrument contract spec, and every rule of
+the H4 Three-Candle Pullback strategy exposed as a parameter rather than
+hard-coded.
 """
 from __future__ import annotations
 
@@ -17,8 +14,7 @@ class InstrumentSpec:
     Defaults are typical retail XAUUSD CFD terms (100oz/lot, 0.01 tick).
     These MUST be replaced with the real broker's symbol specification
     before results are trusted -- risk sizing is only as correct as
-    these numbers (see spec section 18 and the "Risk calculation"
-    warning in the spec's closing notes).
+    these numbers.
     """
 
     symbol: str = "XAUUSD"
@@ -29,15 +25,6 @@ class InstrumentSpec:
     min_lot: float = 0.01
     max_lot: float = 50.0
     lot_step: float = 0.01
-    leverage: float = 100.0  # typical retail XAUUSD leverage (1:100)
-
-    def margin_required(self, lots: float, price: float) -> float:
-        """Margin to OPEN `lots` at `price`, given this symbol's leverage.
-        Not a full margin-call/stop-out simulation -- see risk.py's
-        `max_lots_by_margin` docstring for what this does and doesn't
-        model.
-        """
-        return (lots * self.contract_size * price) / self.leverage
 
     def value_per_price_unit(self, lots: float) -> float:
         """Account-currency P&L for a 1.0 price-unit move at the given lot size."""
@@ -67,101 +54,24 @@ class InstrumentSpec:
 
 
 @dataclass
-class SLStep:
-    trigger_pips: float  # profit (pips) that arms this step
-    adjustment_pips: float  # incremental move of SL toward entry, in pips
+class H4PullbackConfig:
+    # --- direction filter ---
+    ema_period: int = 50  # Daily EMA period
 
+    # --- setup / entry ---
+    pullback_candles: int = 3  # consecutive against-direction H4 candles required
+    atr_period: int = 14  # H4 ATR period
+    atr_multiplier: float = 2.0  # stop distance = atr_multiplier x ATR(14)
+    reward_risk_ratio: float = 1.0  # take-profit distance, as a multiple of the stop distance
 
-@dataclass
-class StrategyConfig:
-    ea_name: str = "XAUUSD-MTF-Zone-EA"
-    magic_number: int = 990001
+    # --- trade management ---
+    time_limit_hours: float = 200.0  # close at market if neither level hit by then
+    one_trade_at_a_time: bool = True
 
-    # --- Risk engine (spec sections 18, 25) ---
-    risk_percent: float = 10.0  # max simultaneous aggregate risk, % of equity
-    daily_drawdown_limit_percent: float = 20.0  # stop new trades for the day past this
+    # --- risk / sizing ---
+    risk_percent: float = 1.0  # % of current equity risked per trade (book recommends 0.5-1%)
 
-    # --- Margin sanity cap (NOT in the spec -- see risk.py docstring) ---
-    # The spec sizes positions purely from $ risk-at-SL, which is
-    # unbounded when the SL distance happens to be very tight (a common
-    # occurrence with real candle-based stops). Without a margin check, a
-    # tiny SL distance can imply an enormous, unfundable lot size that
-    # still nominally "only" risks 10%. This caps a NEW position's own
-    # required margin as a fraction of current equity; it does NOT track
-    # cumulative margin usage across multiple simultaneously open
-    # positions, so treat it as a sanity backstop, not a full margin
-    # simulation.
-    max_margin_usage_percent: float = 50.0
-
-    # --- Initial stop loss (spec section 17) ---
-    initial_sl_buffer_pips_min: float = 0.5
-    initial_sl_buffer_pips_max: float = 1.0
-
-    # --- Entry fill behaviour (spec sections 15/16) ---
-    # The spec's literal text: prefer a fill at the "structural entry
-    # level" (the setup/"X" candle's far wick), and only chase the
-    # market if price "never returns" to it. True means: after a 5M
-    # confirmation, place a limit-style order at that level and wait up
-    # to `pullback_max_wait_bars` further 5-minute bars for price to
-    # touch it; if it never does, the trade is skipped entirely (no
-    # chase). False (the original simplification) enters at market
-    # immediately after the confirmation candle closes, every time.
-    require_pullback_entry: bool = True
-    pullback_max_wait_bars: int = 12  # 12 x 5min = 1 hour
-
-    # --- Progressive SL / break-even (spec section 21) ---
-    sl_steps: list[SLStep] = field(
-        default_factory=lambda: [
-            SLStep(trigger_pips=5, adjustment_pips=0.2),
-            SLStep(trigger_pips=10, adjustment_pips=0.2),
-            SLStep(trigger_pips=15, adjustment_pips=0.2),
-        ]
-    )
-    initial_sl_distance_pips: float = 2.0
-    break_even_trigger_pips: float = 20.0
-
-    # --- Partial take-profit at roadblock (spec sections 22-24) ---
-    roadblock_close_percent: float = 80.0
-    runner_percent: float = 20.0
-
-    # --- Feature toggles (spec section 35) ---
-    enable_additional_entries: bool = True
-    enable_historical_zones: bool = True
-    allow_buy_in_range: bool = True
-    allow_sell_in_range: bool = True
-
-    # --- Market structure detection (not fully specified numerically by
-    #     the doc -- see market_structure.py docstring for the assumption
-    #     this makes explicit and configurable) ---
-    swing_lookback: int = 2  # bars either side for a fractal swing point
-    swing_lookahead_confirm: int = 2
-
-    # --- Zone bookkeeping ---
-    max_historical_zones_per_direction: int = 25
+    # --- data ---
+    daily_origin_offset_hours: float = 0.0  # see timeframes.py for what this shifts
 
     instrument: InstrumentSpec = field(default_factory=InstrumentSpec)
-
-    def sl_distance_pips(self, profit_pips: float, initial_distance_pips: float | None = None) -> float:
-        """Given current profit in pips, return the SL distance-from-entry
-        in pips that the progressive SL ladder + break-even trigger implies.
-
-        `initial_distance_pips` should be the position's OWN actual initial
-        SL distance (section 17's candle-derived SL, which varies per
-        trade) -- the ladder's adjustment_pips are cumulative reductions
-        *from that starting distance*, not from a hard-coded constant.
-        Falls back to `self.initial_sl_distance_pips` (the spec's
-        illustrative "2 pips" example) only if the caller doesn't know the
-        position's real initial distance.
-
-        Distance is always measured from entry toward the trade's profit
-        side; 0.0 means break-even. The ladder only ever tightens the SL
-        (spec section 21: "must never move the SL farther away from entry").
-        """
-        base = self.initial_sl_distance_pips if initial_distance_pips is None else initial_distance_pips
-        if profit_pips >= self.break_even_trigger_pips:
-            return 0.0
-        distance = base
-        for step in sorted(self.sl_steps, key=lambda s: s.trigger_pips):
-            if profit_pips >= step.trigger_pips:
-                distance -= step.adjustment_pips
-        return max(distance, 0.0)

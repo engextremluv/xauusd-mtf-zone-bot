@@ -1,12 +1,16 @@
-"""Bar-by-bar backtest engine: drives the Daily -> 4H -> 30M -> 5M
-hierarchy (spec section 33) off one base 5-minute feed, feeding the
-SignalEngine and TradeManager and tracking equity/risk over time.
+"""Backtest engine for the H4 Three-Candle Pullback strategy.
 
-Only fully closed candles are ever handed to the strategy (spec section
-31): a higher-timeframe bar is "closed" the moment the *next* 5-minute
-bar belongs to a different bucket of that timeframe -- so the very last,
-possibly-still-forming bucket at the end of the requested range is never
-treated as closed, since there is no following 5M bar to prove it ended.
+Takes a single 5-minute bid+ask feed (columns open/high/low/close for
+bid, ao/ah/al/ac for ask) and derives Daily and H4 candles from the bid
+side via `timeframes.build_timeframes` -- see that module for why
+deriving timeframes from one base feed (rather than fetching each
+separately) is the correct, not-an-approximation way to build them.
+
+Fill convention (this is what makes the backtest realistic rather than
+assuming a single frictionless price): a BUY enters at the ASK and exits
+(stop, target, or time-limit) at the BID; a SELL enters at the BID and
+exits at the ASK. This is the actual cost a retail spread imposes on a
+round trip, not a flat fee bolted on afterward.
 """
 from __future__ import annotations
 
@@ -15,208 +19,206 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .candles import Candle
-from .config import StrategyConfig
-from .risk import RiskManager
-from .signals import SignalEngine
+from .risk import max_lots_for_budget
 from .timeframes import build_timeframes
-from .trade_manager import TradeManager
-from .zones import Direction
-
-
-def _owning_bucket_starts(base_index: pd.DatetimeIndex, bucket_index: pd.DatetimeIndex) -> np.ndarray:
-    """For each timestamp in base_index, the start-timestamp of the
-    bucket in bucket_index that contains it (last bucket start <= ts).
-    """
-    positions = np.searchsorted(bucket_index.values, base_index.values, side="right") - 1
-    result = np.full(len(base_index), np.datetime64("NaT"), dtype="datetime64[ns]")
-    valid = positions >= 0
-    result[valid] = bucket_index.values[positions[valid]]
-    return result
+from .config import H4PullbackConfig
+from .indicators import candle_color, compute_atr, compute_ema
 
 
 @dataclass
-class BacktestResult:
-    trade_log: pd.DataFrame
+class _OpenTrade:
+    direction: str  # "buy" | "sell"
+    opened_at: pd.Timestamp
+    entry: float
+    sl: float
+    tp: float
+    stop_distance: float
+    lots: float
+    deadline: pd.Timestamp
+
+
+@dataclass
+class H4PullbackResult:
+    trades: pd.DataFrame
     equity_curve: pd.DataFrame
-    missed_entries: int = 0
-    positions: pd.DataFrame = None  # one row per opened Position: entry/exit detail
 
 
-@dataclass
-class SpreadCommissionModel:
-    spread_price: float = 0.30  # typical retail XAUUSD spread, price units (e.g. $0.30)
-    commission_per_lot_round_turn: float = 0.0
+class H4PullbackEngine:
+    def __init__(self, config: H4PullbackConfig, starting_equity: float = 10_000.0):
+        if not config.one_trade_at_a_time:
+            # the engine only ever tracks a single open trade slot; this
+            # flag documents the rule, it isn't a switch for concurrent
+            # positions (not implemented).
+            raise NotImplementedError(
+                "H4PullbackEngine only supports one_trade_at_a_time=True"
+            )
+        self.config = config
+        self.starting_equity = starting_equity
 
+    def run(self, bidask_5m: pd.DataFrame) -> H4PullbackResult:
+        """bidask_5m: DataFrame indexed by UTC timestamp with columns
+        open/high/low/close (bid) and ao/ah/al/ac (ask), at 5-minute
+        resolution (see data_provider.load_csv_5m_bidask).
+        """
+        cfg = self.config
+        required_ask = {"ao", "ah", "al", "ac"}
+        if not required_ask.issubset(bidask_5m.columns):
+            raise ValueError(f"bidask_5m is missing ask columns: {required_ask - set(bidask_5m.columns)}")
 
-@dataclass
-class _PendingEntry:
-    signal: object  # EntrySignal
-    entry_level: float
-    bars_waited: int = 0
+        base_bid = bidask_5m[["open", "high", "low", "close"]]
+        tfs = build_timeframes(base_bid, daily_origin_offset_hours=cfg.daily_origin_offset_hours)
+        daily = tfs["1D"].copy()
+        h4 = tfs["4h"].copy()
+        m5 = bidask_5m
 
+        daily["ema"] = compute_ema(daily["close"], cfg.ema_period)
+        h4["atr"] = compute_atr(h4, cfg.atr_period)
+        h4["color"] = [candle_color(o, c) for o, c in zip(h4["open"], h4["close"])]
 
-@dataclass
-class BacktestEngine:
-    config: StrategyConfig
-    costs: SpreadCommissionModel = field(default_factory=SpreadCommissionModel)
-    starting_equity: float = 10_000.0
+        # "yesterday's" completed daily candle decides today's mode
+        daily_mode = pd.Series(
+            np.where(daily["close"] > daily["ema"], "buy", "sell"), index=daily.index
+        ).shift(1)
 
-    def run(self, base_5m: pd.DataFrame, daily_origin_offset_hours: float = 0.0) -> BacktestResult:
-        tfs = build_timeframes(base_5m, daily_origin_offset_hours=daily_origin_offset_hours)
-        m5, m30, h4, d1 = tfs["5min"], tfs["30min"], tfs["4h"], tfs["1D"]
-
-        bucket_30 = _owning_bucket_starts(m5.index, m30.index)
-        bucket_4h = _owning_bucket_starts(m5.index, h4.index)
-        bucket_1d = _owning_bucket_starts(m5.index, d1.index)
-
-        signal_engine = SignalEngine(config=self.config)
-        risk_manager = RiskManager(config=self.config, starting_equity=self.starting_equity)
-        trade_manager = TradeManager(config=self.config, risk_manager=risk_manager)
-
+        trades: list[dict] = []
+        equity = self.starting_equity
         equity_rows = []
-        realized_pnl_total = 0.0
-        current_day = None
-        current_day_start_realized = 0.0
+        open_trade: _OpenTrade | None = None
+        run_color: str | None = None
+        run_len = 0
+        h4_index = h4.index
 
-        prev_30 = prev_4h = prev_1d = None
-        n = len(m5)
-        pending_entries: list[_PendingEntry] = []
-        missed_entries = 0
+        for i in range(len(h4)):
+            ts = h4_index[i]
+            row = h4.iloc[i]
 
-        for i in range(n):
-            ts = m5.index[i]
-            row = m5.iloc[i]
-            candle_5m = Candle(row.open, row.high, row.low, row.close)
+            day = ts.normalize()
+            prior_days = daily_mode.index[daily_mode.index <= day]
+            if len(prior_days) == 0 or pd.isna(daily_mode.get(prior_days[-1])):
+                run_color, run_len = None, 0
+                continue
+            mode = daily_mode.loc[prior_days[-1]]
 
-            b30, b4h, b1d = bucket_30[i], bucket_4h[i], bucket_1d[i]
+            if open_trade is not None:
+                open_trade, closed, equity = self._manage_open_trade(open_trade, m5, ts, equity, trades)
+                if closed:
+                    equity_rows.append({"timestamp": ts, "equity": equity})
 
-            # emit close events for the PREVIOUS bucket the moment we
-            # observe membership changed -- see module docstring.
-            # bucket_* arrays are plain numpy datetime64 (tz stripped by
-            # np.searchsorted); re-attach UTC before using them to index
-            # the tz-aware resampled frames.
-            if prev_1d is not None and b1d != prev_1d and pd.notna(prev_1d):
-                d_ts = pd.Timestamp(prev_1d).tz_localize("UTC")
-                closed_so_far = d1.loc[:d_ts]
-                signal_engine.on_daily_close(closed_so_far)
+            color = row["color"]
+            target_color = "red" if mode == "buy" else "green"
+            if color == target_color:
+                run_len = run_len + 1 if run_color == target_color else 1
+                run_color = target_color
+            else:
+                run_color, run_len = None, 0
 
-            if prev_4h is not None and b4h != prev_4h and pd.notna(prev_4h):
-                h_ts = pd.Timestamp(prev_4h).tz_localize("UTC")
-                r = h4.loc[h_ts]
-                signal_engine.on_4h_close(h_ts, Candle(r.open, r.high, r.low, r.close))
+            if open_trade is None and run_len >= cfg.pullback_candles and i + 1 < len(h4):
+                atr = row["atr"]
+                if pd.notna(atr) and atr > 0:
+                    new_trade = self._try_enter(mode, atr, h4_index[i + 1], m5, equity)
+                    if new_trade is not None:
+                        open_trade = new_trade
+                        run_color, run_len = None, 0
 
-            if prev_30 is not None and b30 != prev_30 and pd.notna(prev_30):
-                t_ts = pd.Timestamp(prev_30).tz_localize("UTC")
-                r = m30.loc[t_ts]
-                signal_engine.on_30m_close(t_ts, Candle(r.open, r.high, r.low, r.close))
-
-            # daily drawdown day-roll, using the day this 5m bar falls in
-            trading_day = pd.Timestamp(b1d).tz_localize("UTC") if pd.notna(b1d) else None
-            if trading_day is not None and trading_day != current_day:
-                current_day = trading_day
-                current_day_start_realized = realized_pnl_total
-                risk_manager.roll_day(trading_day, equity=self.starting_equity + realized_pnl_total)
-
-            # manage existing positions against this closed 5M bar
-            log_len_before = len(trade_manager.closed_trade_log)
-            trade_manager.on_5m_bar(ts, candle_5m, signal_engine.zm_30m, signal_engine.zm_4h)
-            realized_pnl_total += sum(
-                t["pnl"] for t in trade_manager.closed_trade_log[log_len_before:]
-            )
-
-            floating = trade_manager.total_floating_pnl(
-                self.config.instrument, lambda direction, c=candle_5m: c.close
-            )
-            realized_today = realized_pnl_total - current_day_start_realized
-            halted = risk_manager.check_daily_drawdown(realized_today, floating)
-
-            # resolve pending pullback-entry orders queued from EARLIER
-            # bars against THIS bar's range (never the bar a signal was
-            # just generated on -- see module docstring / new-signal
-            # handling below for why).
-            if pending_entries:
-                still_pending: list[_PendingEntry] = []
-                for pe in pending_entries:
-                    touched = candle_5m.low <= pe.entry_level <= candle_5m.high
-                    if not halted and touched:
-                        # limit-style fill AT the structural entry level,
-                        # still crossing the spread on a BUY.
-                        entry_price = pe.entry_level + (
-                            self.costs.spread_price if pe.signal.direction is Direction.BUY else 0.0
-                        )
-                        trade_manager.try_open(
-                            pe.signal, ts, entry_price, equity=self.starting_equity + realized_pnl_total
-                        )
-                    else:
-                        pe.bars_waited += 1
-                        if pe.bars_waited < self.config.pullback_max_wait_bars:
-                            still_pending.append(pe)
-                        else:
-                            missed_entries += 1  # price never pulled back; per config, we do NOT chase
-                pending_entries = still_pending
-
-            # generate + act on entry signals from this closed 5M bar
-            signals = signal_engine.on_5m_close(ts, candle_5m)
-            if not halted:
-                for sig in signals:
-                    if self.config.require_pullback_entry:
-                        # spec 15/16: prefer a fill at the structural entry
-                        # level (the setup/"X" candle's far wick) rather
-                        # than chasing the market -- checked starting the
-                        # NEXT bar, never this one (this candle already
-                        # produced the confirmation; using it again to
-                        # decide the fill would be look-ahead).
-                        setup_candle = sig.setup_5m_zone.setup_candle
-                        entry_level = (
-                            setup_candle.high if sig.direction is Direction.BUY else setup_candle.low
-                        )
-                        pending_entries.append(_PendingEntry(signal=sig, entry_level=entry_level))
-                    else:
-                        # base_5m is fetched at OFFER_SIDE_BID: close == bid.
-                        # A BUY fills at ask (bid + spread); a SELL fills at
-                        # the bid itself, i.e. close unadjusted.
-                        entry_price = row.close + (
-                            self.costs.spread_price if sig.direction is Direction.BUY else 0.0
-                        )
-                        trade_manager.try_open(
-                            sig, ts, entry_price, equity=self.starting_equity + realized_pnl_total
-                        )
-
-            equity_rows.append(
-                {
-                    "timestamp": ts,
-                    "equity": self.starting_equity + realized_pnl_total + floating,
-                    "realized_pnl": realized_pnl_total,
-                    "floating_pnl": floating,
-                    "open_positions": sum(1 for p in trade_manager.positions if not p.closed),
-                    "trading_halted": halted,
-                }
-            )
-
-            prev_30, prev_4h, prev_1d = b30, b4h, b1d
-            signal_engine.prune_chains()
-
-        trade_log = pd.DataFrame(trade_manager.closed_trade_log)
-        equity_curve = pd.DataFrame(equity_rows).set_index("timestamp")
-        positions = pd.DataFrame(
-            [
-                {
-                    "position_id": p.id,
-                    "setup_id": p.setup_id,
-                    "direction": p.direction.value,
-                    "opened_at": p.opened_at,
-                    "entry_price": p.entry_price,
-                    "initial_sl": p.initial_sl,
-                    "final_sl": p.sl,
-                    "lots": p.lots,
-                    "closed_at": p.closed_at,
-                    "close_reason": p.close_reason,
-                    "realized_pnl": p.realized_pnl,
-                }
-                for p in trade_manager.positions
-            ]
+        trade_log = pd.DataFrame(trades)
+        equity_curve = pd.DataFrame(equity_rows).set_index("timestamp") if equity_rows else pd.DataFrame(
+            columns=["equity"]
         )
-        return BacktestResult(
-            trade_log=trade_log, equity_curve=equity_curve, missed_entries=missed_entries, positions=positions
+        return H4PullbackResult(trades=trade_log, equity_curve=equity_curve)
+
+    def _try_enter(self, direction: str, atr: float, entry_ts: pd.Timestamp, m5: pd.DataFrame, equity: float):
+        cfg = self.config
+        candidates = m5.loc[entry_ts:]
+        if len(candidates) == 0:
+            return None
+        entry_bar = candidates.iloc[0]
+        entry_ts = candidates.index[0]
+
+        entry_price = entry_bar["ao"] if direction == "buy" else entry_bar["open"]
+        stop_distance = cfg.atr_multiplier * atr
+        tp_distance = cfg.reward_risk_ratio * stop_distance
+        if direction == "buy":
+            sl = entry_price - stop_distance
+            tp = entry_price + tp_distance
+        else:
+            sl = entry_price + stop_distance
+            tp = entry_price - tp_distance
+
+        budget = equity * (cfg.risk_percent / 100.0)
+        lots = max_lots_for_budget(cfg.instrument, stop_distance, budget)
+        if lots < cfg.instrument.min_lot:
+            return None
+
+        return _OpenTrade(
+            direction=direction,
+            opened_at=entry_ts,
+            entry=entry_price,
+            sl=sl,
+            tp=tp,
+            stop_distance=stop_distance,
+            lots=lots,
+            deadline=entry_ts + pd.Timedelta(hours=cfg.time_limit_hours),
         )
+
+    def _manage_open_trade(
+        self, open_trade: _OpenTrade, m5: pd.DataFrame, h4_ts: pd.Timestamp, equity: float, trades: list[dict]
+    ):
+        window = m5.loc[open_trade.opened_at : h4_ts]
+        window = window[window.index > open_trade.opened_at]
+        for t5, bar in window.iterrows():
+            if t5 > open_trade.deadline:
+                break
+            if open_trade.direction == "buy":
+                hit_sl = bar["low"] <= open_trade.sl  # exits at BID
+                hit_tp = bar["high"] >= open_trade.tp
+            else:
+                hit_sl = bar["ah"] >= open_trade.sl  # exits at ASK
+                hit_tp = bar["al"] <= open_trade.tp
+            if hit_sl or hit_tp:
+                if hit_sl and hit_tp:
+                    reason, exit_price = "sl_and_tp_same_bar", open_trade.sl
+                elif hit_sl:
+                    reason, exit_price = "sl", open_trade.sl
+                else:
+                    reason, exit_price = "tp", open_trade.tp
+                equity = self._close(open_trade, exit_price, t5, reason, equity, trades)
+                return None, True, equity
+        if h4_ts >= open_trade.deadline:
+            last_bar = m5.loc[:h4_ts].iloc[-1]
+            exit_price = last_bar["close"] if open_trade.direction == "buy" else last_bar["ac"]
+            equity = self._close(open_trade, exit_price, h4_ts, "time_limit", equity, trades)
+            return None, True, equity
+        return open_trade, False, equity
+
+    def _close(
+        self, open_trade: _OpenTrade, exit_price: float, exit_ts: pd.Timestamp, reason: str, equity: float, trades: list[dict]
+    ) -> float:
+        cfg = self.config
+        signed_move = (
+            exit_price - open_trade.entry if open_trade.direction == "buy" else open_trade.entry - exit_price
+        )
+        r_multiple = signed_move / open_trade.stop_distance
+        if reason == "sl_and_tp_same_bar":
+            # same convention the source strategy book uses: counts as a loss
+            r_multiple = -1.0
+            signed_move = -open_trade.stop_distance
+        pnl = cfg.instrument.pnl(open_trade.lots, signed_move)
+        equity += pnl
+        trades.append(
+            {
+                "direction": open_trade.direction,
+                "opened_at": open_trade.opened_at,
+                "entry": open_trade.entry,
+                "sl": open_trade.sl,
+                "tp": open_trade.tp,
+                "stop_distance": open_trade.stop_distance,
+                "lots": open_trade.lots,
+                "closed_at": exit_ts,
+                "exit_price": exit_price,
+                "reason": reason,
+                "r_multiple": r_multiple,
+                "pnl": pnl,
+                "equity_after": equity,
+            }
+        )
+        return equity
