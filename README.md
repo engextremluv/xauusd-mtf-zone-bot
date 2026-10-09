@@ -1,11 +1,26 @@
-# XAUUSD H4 Three-Candle Pullback Backtester
+# XAUUSD H4 Three-Candle Pullback
 
-A Python backtesting engine for the "H4 Three-Candle Pullback" strategy
-(from an uploaded strategy book): a simple, fully-specified trend-pullback
-system for trading gold.
+A Python backtesting engine, **and a live MT5 Expert Advisor**, for the
+"H4 Three-Candle Pullback" strategy (from an uploaded strategy book): a
+simple, fully-specified trend-pullback system for trading gold.
+
+- `src/xauusd_bot/` — the Python backtester (this README's main focus)
+- `mt5_ea/H4ThreeCandlePullback.mq5` — a live MT5 Expert Advisor
+  implementing the identical rules, so you can attach it to a real MT5
+  chart. See **"Live trading: the MT5 Expert Advisor"** near the bottom.
 
 > **This is not financial advice.** A backtest, even an honest one, is
 > not proof a strategy will make money live. Paper-trade first.
+>
+> A parameter sensitivity sweep (varying ATR stop multiplier, reward:risk
+> ratio, EMA period, and the pullback candle count one at a time) found
+> that the reward:risk ratio and EMA period are robust — the edge holds
+> across a wide range of settings. The ATR stop multiplier and, more
+> concerningly, the "exactly 3 candles" rule are **not** robust: nearby
+> values (2 or 4 candles instead of 3) turn the result flat or negative.
+> That's a real warning sign of curve-fitting on the exact numbers the
+> book settled on, even though the core trend-pullback idea looks real.
+> See the git history for the full sweep output.
 
 ## The rules
 
@@ -146,3 +161,65 @@ by secretly trading at one frictionless price), that a second signal is
 correctly blocked while a trade is already open, and position-sizing
 edge cases (never rounds a too-small size up to the minimum lot, never
 exceeds the risk budget after rounding).
+
+---
+
+## Live trading: the MT5 Expert Advisor
+
+`mt5_ea/H4ThreeCandlePullback.mq5` implements the exact same six rules
+live, directly in MetaTrader 5 — Daily EMA direction, the 3-candle H4
+setup, ATR-based stop/target, the time-limit close, one trade at a
+time, and risk-percent position sizing read from the broker's real
+contract spec (tick value, tick size, lot step) rather than an assumed
+one.
+
+**This file has not been compiled or run in a real MetaEditor/MT5** —
+there's no MT5 terminal available in the environment this was built in.
+It was written carefully against the standard MQL5 trade API, but
+**compile it yourself first** (MetaEditor → Open → F7) and report any
+errors back before trusting it on an account.
+
+### Safety default
+
+`InpAutoTrade` defaults to **false**. With it false, the EA still runs
+its full logic every H4 bar and prints + `Alert()`s + push-notifies on
+every signal (direction, entry price, stop, target, lot size) — but
+sends no real order. Watch it on a demo account for a while before
+flipping `InpAutoTrade` to `true`. Given the sensitivity-sweep warning
+above about the "exactly 3 candles" rule, this isn't just boilerplate
+caution — there's a real, demonstrated risk this strategy's exact
+parameters don't generalize.
+
+### Installing
+
+1. Open MetaEditor (from MT5: Tools → MetaQuotes Language Editor, or F4).
+2. File → Open → navigate to `mt5_ea/H4ThreeCandlePullback.mq5` (or copy
+   it into your `MQL5/Experts/` folder first, then open it from there so
+   MT5 can find it in the Navigator).
+3. Compile (F7). Fix any errors — and if you hit any, paste them back
+   here so this file can be corrected.
+4. In MT5: open an XAUUSD chart (any timeframe — the EA reads Daily and
+   H4 data explicitly regardless of which chart it's attached to),
+   drag the EA from Navigator → Expert Advisors onto the chart.
+5. In the EA's input dialog, review every parameter (they default to
+   the book's own values — see the Python `H4PullbackConfig` defaults
+   for the same numbers) and confirm **AutoTrading is enabled** in MT5's
+   toolbar (the EA won't place real orders even with `InpAutoTrade=true`
+   if MT5's own global AutoTrading button is off).
+
+### Known limitations vs. the Python backtest
+
+- **Broker server time, not UTC.** The EA reads whatever H4/Daily
+  candles your broker's server produces. The Python backtest anchors to
+  00:00 UTC. If your broker's day/H4 boundaries differ (common — many
+  use GMT+2/+3), you will get signals at different times than the
+  backtest, exactly as the source book's own Chapter 3 warns.
+  `InpEmaPeriod`/`InpAtrPeriod`/etc. still match; only the candle
+  boundaries can differ.
+- **Real spread, slippage, and swap** apply automatically (this is
+  more realistic than the backtest, not less) — but also means live
+  results will differ trade-by-trade from the backtest even on
+  identical signals.
+- **No swap-fee modeling** in either the EA or the Python backtest —
+  check your broker's XAUUSD swap rate given the ~31-hour average hold
+  time the source book reports.
